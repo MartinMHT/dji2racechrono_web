@@ -1,504 +1,635 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>DJI2RaceChrono</title>
-<link rel="icon" type="image/png" href="icon.png">
-<link rel="apple-touch-icon" href="icon.png">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;min-height:100vh}
-h1{font-size:20px;text-align:center;margin:8px 0 16px;color:#00d4ff}
-.card{background:#16213e;border-radius:12px;padding:16px;margin-bottom:12px}
-.card h2{font-size:14px;color:#888;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px}
-label{display:flex;align-items:center;gap:10px;padding:8px 0;font-size:16px;cursor:pointer}
-input[type=checkbox]{width:22px;height:22px;accent-color:#00d4ff}
-input[type=range]{flex:1;accent-color:#00d4ff}
-.range-row{display:flex;align-items:center;gap:10px;padding:4px 0 8px 32px}
-.range-val{min-width:28px;text-align:center;font-weight:bold;color:#00d4ff}
-.btn{display:block;width:100%;padding:14px;border:none;border-radius:10px;font-size:17px;font-weight:600;cursor:pointer;margin-top:8px;transition:opacity .2s}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn-file{background:#0f3460;color:#00d4ff;border:2px dashed #00d4ff}
-.btn-convert{background:#00d4ff;color:#1a1a2e}
-.btn-download{background:#00c853;color:#fff}
-.file-name{font-size:13px;color:#aaa;margin-top:6px;word-break:break-all}
-.progress{width:100%;height:6px;background:#0f3460;border-radius:3px;margin-top:10px;overflow:hidden;display:none}
-.progress-bar{height:100%;background:#00d4ff;width:0;transition:width .3s}
-#log{background:#0d1117;border-radius:8px;padding:10px;margin-top:8px;font-family:'SF Mono',monospace;font-size:12px;line-height:1.6;max-height:200px;overflow-y:auto;white-space:pre-wrap;display:none}
-.hidden{display:none!important}
-</style>
-</head>
-<body>
-<h1>DJI2RaceChrono</h1>
-
-<div class="card">
-<h2>Video File</h2>
-<button class="btn btn-file" id="btnFile">Select DJI Video (.MP4)</button>
-<input type="file" id="fileInput" accept=".mp4,.MP4" class="hidden">
-<div class="file-name" id="fileName"></div>
-</div>
-
-<div class="card">
-<h2>Options</h2>
-<label><input type="checkbox" id="chkSmooth" checked> Adaptive Smoothing</label>
-<div class="range-row" id="smoothRow">
-<span>Window:</span>
-<input type="range" id="smoothWindow" min="3" max="15" step="2" value="3">
-<span class="range-val" id="smoothVal">3</span>
-</div>
-<label><input type="checkbox" id="chk100hz" checked> Interpolation</label>
-<div class="range-row" id="hzRow">
-<span>Hz:</span>
-<input type="range" id="hzValue" min="10" max="100" step="10" value="100">
-<span class="range-val" id="hzVal">100</span>
-</div>
-</div>
-
-<div class="card">
-<button class="btn btn-convert" id="btnConvert" disabled>Convert</button>
-<div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
-<button class="btn btn-download hidden" id="btnDownload">Download .nmea</button>
-</div>
-
-<div id="log"></div>
-
-<script>
-// ========== UI ==========
-const $ = id => document.getElementById(id);
-const fileInput = $('fileInput'), btnFile = $('btnFile'), fileName = $('fileName');
-const chkSmooth = $('chkSmooth'), smoothWindow = $('smoothWindow'), smoothVal = $('smoothVal'), smoothRow = $('smoothRow');
-const chk100hz = $('chk100hz'), btnConvert = $('btnConvert'), btnDownload = $('btnDownload');
-const progress = $('progress'), progressBar = $('progressBar'), logEl = $('log');
-let selectedFile = null, nmeaBlob = null, nmeaName = '';
-
-btnFile.onclick = () => fileInput.click();
-fileInput.onchange = e => { selectedFile = e.target.files[0]; if(selectedFile){fileName.textContent=selectedFile.name;btnConvert.disabled=false;btnDownload.classList.add('hidden')} };
-smoothWindow.oninput = () => { smoothVal.textContent = smoothWindow.value };
-chkSmooth.onchange = () => { smoothRow.style.display = chkSmooth.checked ? 'flex' : 'none' };
-const hzValue = $('hzValue'), hzVal = $('hzVal'), hzRow = $('hzRow');
-hzValue.oninput = () => { hzVal.textContent = hzValue.value };
-chk100hz.onchange = () => { hzRow.style.display = chk100hz.checked ? 'flex' : 'none' };
-btnConvert.onclick = run;
-btnDownload.onclick = () => { const a=document.createElement('a');a.href=URL.createObjectURL(nmeaBlob);a.download=nmeaName;a.click() };
-
-function log(msg) { logEl.style.display='block'; logEl.textContent += msg+'\n'; logEl.scrollTop=logEl.scrollHeight }
-function setProgress(pct) { progress.style.display='block'; progressBar.style.width=pct+'%' }
-
-// ========== MP4 Parser ==========
-async function readSlice(file, offset, length) {
-  const blob = file.slice(offset, offset + length);
-  return new DataView(await blob.arrayBuffer());
-}
-
-async function parseMP4(file) {
-  log('Parsing MP4...');
-  setProgress(5);
-  // Find moov box
-  let pos = 0;
-  let moovOffset = -1, moovSize = 0;
-  while (pos < file.size) {
-    const hdr = await readSlice(file, pos, 16);
-    let boxSize = hdr.getUint32(0);
-    const boxType = String.fromCharCode(hdr.getUint8(4),hdr.getUint8(5),hdr.getUint8(6),hdr.getUint8(7));
-    if (boxSize === 1) boxSize = Number(hdr.getBigUint64(8));
-    if (boxSize === 0) break;
-    if (boxType === 'moov') { moovOffset = pos; moovSize = boxSize; break; }
-    pos += boxSize;
-  }
-  if (moovOffset < 0) throw new Error('No moov box found');
-  setProgress(10);
-
-  const moovBuf = await readSlice(file, moovOffset + 8, moovSize - 8);
-  const moovArr = new Uint8Array(moovBuf.buffer);
-
-  // Parse moov for track 3 (metadata) chunk info
-  let trackCount = 0, offsets = [], sizes = [];
-  function parseBoxes(data, offset, end, handler) {
-    let i = offset;
-    while (i + 8 <= end) {
-      let sz = (data[i]<<24|data[i+1]<<16|data[i+2]<<8|data[i+3])>>>0;
-      const tp = String.fromCharCode(data[i+4],data[i+5],data[i+6],data[i+7]);
-      let hdrSz = 8;
-      if (sz === 1 && i+16 <= end) {
-        sz = Number((BigInt(data[i+8])<<56n|BigInt(data[i+9])<<48n|BigInt(data[i+10])<<40n|BigInt(data[i+11])<<32n|BigInt(data[i+12])<<24n|BigInt(data[i+13])<<16n|BigInt(data[i+14])<<8n|BigInt(data[i+15])));
-        hdrSz = 16;
-      }
-      if (sz === 0 || sz < hdrSz) break;
-      handler(tp, i + hdrSz, i + sz, data);
-      i += sz;
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>DJI2RaceChrono</title>
+  <link rel="icon" type="image/png" href="icon.png">
+  <link rel="apple-touch-icon" href="icon.png">
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
     }
-  }
 
-  // Walk moov → trak(3) → mdia → minf → stbl → co64/stco + stsz
-  parseBoxes(moovArr, 0, moovArr.length, (tp, s, e, d) => {
-    if (tp === 'trak') {
-      trackCount++;
-      if (trackCount === 3) {
-        parseBoxes(d, s, e, (tp2, s2, e2, d2) => {
-          if (tp2 === 'mdia') parseBoxes(d2, s2, e2, (tp3, s3, e3, d3) => {
-            if (tp3 === 'minf') parseBoxes(d3, s3, e3, (tp4, s4, e4, d4) => {
-              if (tp4 === 'stbl') parseBoxes(d4, s4, e4, (tp5, s5, e5, d5) => {
-                const dv = new DataView(d5.buffer, d5.byteOffset);
-                if (tp5 === 'co64') {
-                  const cnt = dv.getUint32(s5+4);
-                  for (let j=0;j<cnt;j++) offsets.push(Number(dv.getBigUint64(s5+8+j*8)));
-                } else if (tp5 === 'stco') {
-                  const cnt = dv.getUint32(s5+4);
-                  for (let j=0;j<cnt;j++) offsets.push(dv.getUint32(s5+8+j*4));
-                } else if (tp5 === 'stsz') {
-                  const cnt = dv.getUint32(s5+8);
-                  for (let j=0;j<cnt;j++) sizes.push(dv.getUint32(s5+12+j*4));
-                }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+      min-height: 100vh
+    }
+
+    h1 {
+      font-size: 20px;
+      text-align: center;
+      margin: 8px 0 16px;
+      color: #00d4ff
+    }
+
+    .card {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px
+    }
+
+    .card h2 {
+      font-size: 14px;
+      color: #888;
+      margin-bottom: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px
+    }
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 0;
+      font-size: 16px;
+      cursor: pointer
+    }
+
+    input[type=checkbox] {
+      width: 22px;
+      height: 22px;
+      accent-color: #00d4ff
+    }
+
+    input[type=range] {
+      flex: 1;
+      accent-color: #00d4ff
+    }
+
+    .range-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 4px 0 8px 32px
+    }
+
+    .range-val {
+      min-width: 28px;
+      text-align: center;
+      font-weight: bold;
+      color: #00d4ff
+    }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 10px;
+      font-size: 17px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: opacity .2s
+    }
+
+    .btn:disabled {
+      opacity: .4;
+      cursor: not-allowed
+    }
+
+    .btn-file {
+      background: #0f3460;
+      color: #00d4ff;
+      border: 2px dashed #00d4ff
+    }
+
+    .btn-convert {
+      background: #00d4ff;
+      color: #1a1a2e
+    }
+
+    .btn-download {
+      background: #00c853;
+      color: #fff
+    }
+
+    .file-name {
+      font-size: 13px;
+      color: #aaa;
+      margin-top: 6px;
+      word-break: break-all
+    }
+
+    .progress {
+      width: 100%;
+      height: 6px;
+      background: #0f3460;
+      border-radius: 3px;
+      margin-top: 10px;
+      overflow: hidden;
+      display: none
+    }
+
+    .progress-bar {
+      height: 100%;
+      background: #00d4ff;
+      width: 0;
+      transition: width .3s
+    }
+
+    #log {
+      background: #0d1117;
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 8px;
+      font-family: 'SF Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      display: none
+    }
+
+    .hidden {
+      display: none !important
+    }
+  </style>
+</head>
+
+<body>
+  <h1>DJI2RaceChrono</h1>
+
+  <div class="card">
+    <h2>Video File</h2>
+    <button class="btn btn-file" id="btnFile">Select DJI Video (.MP4)</button>
+    <input type="file" id="fileInput" accept=".mp4,.MP4" class="hidden">
+    <div class="file-name" id="fileName"></div>
+  </div>
+
+  <div class="card">
+    <h2>Options</h2>
+    <label><input type="checkbox" id="chkSmooth" checked> Adaptive Smoothing</label>
+    <div class="range-row" id="smoothRow">
+      <span>Window:</span>
+      <input type="range" id="smoothWindow" min="3" max="15" step="2" value="3">
+      <span class="range-val" id="smoothVal">3</span>
+    </div>
+    <label><input type="checkbox" id="chk100hz" checked> Interpolation</label>
+    <div class="range-row" id="hzRow">
+      <span>Hz:</span>
+      <input type="range" id="hzValue" min="10" max="100" step="10" value="100">
+      <span class="range-val" id="hzVal">100</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <button class="btn btn-convert" id="btnConvert" disabled>Convert</button>
+    <div class="progress" id="progress">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <button class="btn btn-download hidden" id="btnDownload">Download .nmea</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    // ========== UI ==========
+    const $ = id => document.getElementById(id);
+    const fileInput = $('fileInput'), btnFile = $('btnFile'), fileName = $('fileName');
+    const chkSmooth = $('chkSmooth'), smoothWindow = $('smoothWindow'), smoothVal = $('smoothVal'), smoothRow = $('smoothRow');
+    const chk100hz = $('chk100hz'), btnConvert = $('btnConvert'), btnDownload = $('btnDownload');
+    const progress = $('progress'), progressBar = $('progressBar'), logEl = $('log');
+    let selectedFile = null, nmeaBlob = null, nmeaName = '', cancelled = false, running = false;
+
+    btnFile.onclick = () => fileInput.click();
+    fileInput.onchange = e => { selectedFile = e.target.files[0]; if (selectedFile) { fileName.textContent = selectedFile.name; btnConvert.disabled = false; btnDownload.classList.add('hidden'); progress.style.display = 'none'; logEl.style.display = 'none'; logEl.textContent = ''; if (running) cancelled = true } };
+    smoothWindow.oninput = () => { smoothVal.textContent = smoothWindow.value };
+    chkSmooth.onchange = () => { smoothRow.style.display = chkSmooth.checked ? 'flex' : 'none' };
+    const hzValue = $('hzValue'), hzVal = $('hzVal'), hzRow = $('hzRow');
+    hzValue.oninput = () => { hzVal.textContent = hzValue.value };
+    chk100hz.onchange = () => { hzRow.style.display = chk100hz.checked ? 'flex' : 'none' };
+    btnConvert.onclick = run;
+    btnDownload.onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(nmeaBlob); a.download = nmeaName; a.click() };
+
+    function log(msg) { logEl.style.display = 'block'; logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight }
+    function setProgress(pct) { progress.style.display = 'block'; progressBar.style.width = pct + '%' }
+
+    // ========== MP4 Parser ==========
+    async function readSlice(file, offset, length) {
+      const blob = file.slice(offset, offset + length);
+      return new DataView(await blob.arrayBuffer());
+    }
+
+    async function parseMP4(file) {
+      log('Parsing MP4...');
+      // Find moov box
+      let pos = 0;
+      let moovOffset = -1, moovSize = 0;
+      while (pos < file.size) {
+        if (cancelled) throw new Error('Cancelled');
+        const hdr = await readSlice(file, pos, 16);
+        let boxSize = hdr.getUint32(0);
+        const boxType = String.fromCharCode(hdr.getUint8(4), hdr.getUint8(5), hdr.getUint8(6), hdr.getUint8(7));
+        if (boxSize === 1) boxSize = Number(hdr.getBigUint64(8));
+        if (boxSize === 0) break;
+        if (boxType === 'moov') { moovOffset = pos; moovSize = boxSize; break; }
+        pos += boxSize;
+      }
+      if (moovOffset < 0) throw new Error('No moov box found');
+
+      if (cancelled) throw new Error('Cancelled');
+      const moovBuf = await readSlice(file, moovOffset + 8, moovSize - 8);
+      const moovArr = new Uint8Array(moovBuf.buffer);
+
+      // Parse moov for track 3 (metadata) chunk info
+      let trackCount = 0, offsets = [], sizes = [];
+      function parseBoxes(data, offset, end, handler) {
+        let i = offset;
+        while (i + 8 <= end) {
+          let sz = (data[i] << 24 | data[i + 1] << 16 | data[i + 2] << 8 | data[i + 3]) >>> 0;
+          const tp = String.fromCharCode(data[i + 4], data[i + 5], data[i + 6], data[i + 7]);
+          let hdrSz = 8;
+          if (sz === 1 && i + 16 <= end) {
+            sz = Number((BigInt(data[i + 8]) << 56n | BigInt(data[i + 9]) << 48n | BigInt(data[i + 10]) << 40n | BigInt(data[i + 11]) << 32n | BigInt(data[i + 12]) << 24n | BigInt(data[i + 13]) << 16n | BigInt(data[i + 14]) << 8n | BigInt(data[i + 15])));
+            hdrSz = 16;
+          }
+          if (sz === 0 || sz < hdrSz) break;
+          handler(tp, i + hdrSz, i + sz, data);
+          i += sz;
+        }
+      }
+
+      // Walk moov → trak(3) → mdia → minf → stbl → co64/stco + stsz
+      parseBoxes(moovArr, 0, moovArr.length, (tp, s, e, d) => {
+        if (tp === 'trak') {
+          trackCount++;
+          if (trackCount === 3) {
+            parseBoxes(d, s, e, (tp2, s2, e2, d2) => {
+              if (tp2 === 'mdia') parseBoxes(d2, s2, e2, (tp3, s3, e3, d3) => {
+                if (tp3 === 'minf') parseBoxes(d3, s3, e3, (tp4, s4, e4, d4) => {
+                  if (tp4 === 'stbl') parseBoxes(d4, s4, e4, (tp5, s5, e5, d5) => {
+                    const dv = new DataView(d5.buffer, d5.byteOffset);
+                    if (tp5 === 'co64') {
+                      const cnt = dv.getUint32(s5 + 4);
+                      for (let j = 0; j < cnt; j++) offsets.push(Number(dv.getBigUint64(s5 + 8 + j * 8)));
+                    } else if (tp5 === 'stco') {
+                      const cnt = dv.getUint32(s5 + 4);
+                      for (let j = 0; j < cnt; j++) offsets.push(dv.getUint32(s5 + 8 + j * 4));
+                    } else if (tp5 === 'stsz') {
+                      const cnt = dv.getUint32(s5 + 8);
+                      for (let j = 0; j < cnt; j++) sizes.push(dv.getUint32(s5 + 12 + j * 4));
+                    }
+                  });
+                });
               });
             });
-          });
+          }
+        }
+      });
+
+      if (!offsets.length || !sizes.length) throw new Error('No metadata track found (track 3)');
+      log(`Found ${offsets.length} metadata chunks`);
+
+      // Read and concatenate metadata chunks
+      let totalSize = sizes.reduce((a, b) => a + b, 0);
+      let metadata = new Uint8Array(totalSize);
+      let writePos = 0;
+      for (let i = 0; i < offsets.length; i++) {
+        if (cancelled) throw new Error('Cancelled');
+        const chunk = await readSlice(file, offsets[i], sizes[i]);
+        metadata.set(new Uint8Array(chunk.buffer), writePos);
+        writePos += sizes[i];
+        if (i % 10 === 0) setProgress((i / offsets.length) * 100);
+      }
+      log(`Metadata extracted: ${totalSize} bytes`);
+      return metadata;
+    }
+
+    // ========== Protobuf Decoder ==========
+    function pbDecode(buf, offset, end) {
+      const fields = {};
+      let pos = offset || 0;
+      const stop = end || buf.length;
+      while (pos < stop) {
+        const [tag, newPos] = pbVarint(buf, pos);
+        pos = newPos;
+        const fieldNum = tag >>> 3;
+        const wireType = tag & 7;
+        let value;
+        if (wireType === 0) { // varint
+          const [v, np] = pbVarint(buf, pos); pos = np; value = v;
+        } else if (wireType === 1) { // 64-bit
+          const dv = new DataView(buf.buffer, buf.byteOffset + pos, 8);
+          value = dv.getFloat64(0, true); pos += 8;
+        } else if (wireType === 2) { // length-delimited
+          const [len, np] = pbVarint(buf, pos); pos = np;
+          value = buf.subarray(pos, pos + len); pos += len;
+        } else if (wireType === 5) { // 32-bit
+          const dv = new DataView(buf.buffer, buf.byteOffset + pos, 4);
+          value = dv.getFloat32(0, true); pos += 4;
+        } else {
+          break; // unknown wire type
+        }
+        if (!fields[fieldNum]) fields[fieldNum] = [];
+        fields[fieldNum].push({ wireType, value });
+      }
+      return fields;
+    }
+
+    function pbVarint(buf, pos) {
+      let result = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        result |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+        if (shift > 35) break; // safety for uint32 range
+      }
+      return [result >>> 0, pos];
+    }
+
+    function pbGetMsg(fields, num) { const f = fields[num]; return f ? pbDecode(f[0].value, 0, f[0].value.length) : null }
+    function pbGetMsgAll(fields, num) { const f = fields[num]; return f ? f.map(e => pbDecode(e.value, 0, e.value.length)) : [] }
+    function pbGetVarint(fields, num) { const f = fields[num]; return f ? f[0].value : 0 }
+    function pbGetDouble(fields, num) { const f = fields[num]; return f ? f[0].value : 0 }
+    function pbGetString(fields, num) { const f = fields[num]; return f ? new TextDecoder().decode(f[0].value) : '' }
+
+    function extractGPS(metadata) {
+      log('Decoding protobuf...');
+      const root = pbDecode(metadata, 0, metadata.length);
+
+      // Check camera model
+      const globalInfo = pbGetMsg(root, 1);
+      if (globalInfo) {
+        const modules = pbGetMsgAll(globalInfo, 1);
+        if (modules.length) {
+          const camName = pbGetString(modules[0], 10);
+          const sn = pbGetString(modules[0], 5);
+          log(`Camera: ${camName}${sn ? ' (SN: ' + sn + ')' : ''}`);
+        }
+      }
+
+      // Extract GPS points: root.3[].4.2.{1.{2,3}, 2, 6.1}
+      const gpsEntries = pbGetMsgAll(root, 3);
+      log(`Raw GPS entries: ${gpsEntries.length}`);
+      const points = [];
+      for (const entry of gpsEntries) {
+        try {
+          const remoteGps = pbGetMsg(entry, 4); if (!remoteGps) continue;
+          const coords = pbGetMsg(remoteGps, 2); if (!coords) continue;
+          const info = pbGetMsg(coords, 1); if (!info) continue;
+          const lat = pbGetDouble(info, 2);
+          const lon = pbGetDouble(info, 3);
+          const altMm = pbGetVarint(coords, 2);
+          const dtMsg = pbGetMsg(coords, 6);
+          const dtStr = dtMsg ? pbGetString(dtMsg, 1) : '';
+          if (lat === 0 && lon === 0) continue;
+          points.push({ lat, lon, alt: altMm / 1000, time: new Date(dtStr) });
+        } catch (e) { continue; }
+      }
+      log(`Valid GPS points: ${points.length}`);
+      return points;
+    }
+
+    // ========== GPS Processing ==========
+    const R = 6371000;
+    function haversine(lat1, lon1, lat2, lon2) {
+      const p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180, dp = (lat2 - lat1) * Math.PI / 180, dl = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+    function bearing(lat1, lon1, lat2, lon2) {
+      const p1 = lat1 * Math.PI / 180, p2 = lat2 * Math.PI / 180, dl = (lon2 - lon1) * Math.PI / 180;
+      const x = Math.sin(dl) * Math.cos(p2), y = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+      return ((Math.atan2(x, y) * 180 / Math.PI) + 360) % 360;
+    }
+
+    function deduplicate(pts) {
+      if (!pts.length) return [];
+      const r = [pts[0]];
+      for (let i = 1; i < pts.length; i++) if (pts[i].lat !== r[r.length - 1].lat || pts[i].lon !== r[r.length - 1].lon) r.push(pts[i]);
+      return r;
+    }
+
+    function assignTimestamps(pts) {
+      if (pts.length < 2) return;
+      const groups = []; let cur = [0];
+      for (let i = 1; i < pts.length; i++) {
+        const cs = Math.floor(pts[i].time.getTime() / 1000), gs = Math.floor(pts[cur[0]].time.getTime() / 1000);
+        if (cs === gs) cur.push(i); else { groups.push(cur); cur = [i]; }
+      }
+      groups.push(cur);
+      for (const g of groups) {
+        const n = g.length, base = Math.floor(pts[g[0]].time.getTime() / 1000) * 1000;
+        for (let j = 0; j < n; j++) pts[g[j]].time = new Date(base + j / n * 1000);
+      }
+    }
+
+    function smoothGPS(pts, window) {
+      if (pts.length < 3) return pts;
+      const n = pts.length, halfMax = Math.floor(window / 2);
+      // Pre-calc speeds, accels, heading rates
+      const spd = new Float64Array(n), acc = new Float64Array(n), hr = new Float64Array(n);
+      for (let i = 1; i < n; i++) {
+        const dt = (pts[i].time - pts[i - 1].time) / 1000;
+        if (dt > 0) spd[i] = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon) / dt;
+        else spd[i] = spd[i - 1];
+      }
+      spd[0] = spd[1] || 0;
+      for (let i = 1; i < n; i++) { const dt = (pts[i].time - pts[i - 1].time) / 1000; if (dt > 0) acc[i] = Math.abs(spd[i] - spd[i - 1]) / dt }
+      acc[0] = acc[1] || 0;
+      let prevH = 0;
+      for (let i = 1; i < n; i++) {
+        const h = bearing(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+        if (i === 1) prevH = h;
+        let d = Math.abs(h - prevH); if (d > 180) d = 360 - d;
+        hr[i] = d; prevH = h;
+      }
+      hr[0] = hr[1] || 0;
+      // Pre-smooth
+      const hrs = Float64Array.from(hr), acs = Float64Array.from(acc);
+      for (let i = 2; i < n - 2; i++) { hrs[i] = (hr[i - 2] + hr[i - 1] + hr[i] + hr[i + 1] + hr[i + 2]) / 5; acs[i] = (acc[i - 2] + acc[i - 1] + acc[i] + acc[i + 1] + acc[i + 2]) / 5 }
+
+      const result = [];
+      for (let i = 0; i < n; i++) {
+        let effH;
+        if (acs[i] > 19.6) effH = halfMax;
+        else { const s = Math.max(0, 1 - hrs[i] / 3); effH = Math.floor(halfMax * s); }
+        if (effH === 0) { result.push({ ...pts[i] }); continue }
+        const start = Math.max(0, i - effH), end = Math.min(n, i + effH + 1);
+        const sigma = Math.max(effH / 2, .5);
+        let wSum = 0, aLat = 0, aLon = 0, aAlt = 0;
+        for (let j = start; j < end; j++) { const w = Math.exp(-.5 * ((j - i) / sigma) ** 2); wSum += w; aLat += pts[j].lat * w; aLon += pts[j].lon * w; aAlt += pts[j].alt * w }
+        result.push({ lat: aLat / wSum, lon: aLon / wSum, alt: aAlt / wSum, time: pts[i].time });
+      }
+      return result;
+    }
+
+    function interpolateHz(pts, hz) {
+      if (pts.length < 2) return pts;
+      hz = hz || 100;
+      const n = pts.length, t0 = pts[0].time.getTime();
+      const times = pts.map(p => (p.time.getTime() - t0) / 1000);
+      const lats = pts.map(p => p.lat), lons = pts.map(p => p.lon), alts = pts.map(p => p.alt);
+      // Catmull-Rom tangents
+      const ml = new Float64Array(n), mo = new Float64Array(n), ma = new Float64Array(n);
+      for (let i = 1; i < n - 1; i++) { const dt = times[i + 1] - times[i - 1]; if (dt > 0) { ml[i] = (lats[i + 1] - lats[i - 1]) / dt; mo[i] = (lons[i + 1] - lons[i - 1]) / dt; ma[i] = (alts[i + 1] - alts[i - 1]) / dt } }
+      if (times[1] - times[0] > 0) { const d = times[1] - times[0]; ml[0] = (lats[1] - lats[0]) / d; mo[0] = (lons[1] - lons[0]) / d; ma[0] = (alts[1] - alts[0]) / d }
+      if (times[n - 1] - times[n - 2] > 0) { const d = times[n - 1] - times[n - 2]; ml[n - 1] = (lats[n - 1] - lats[n - 2]) / d; mo[n - 1] = (lons[n - 1] - lons[n - 2]) / d; ma[n - 1] = (alts[n - 1] - alts[n - 2]) / d }
+      // Clamp tangents
+      for (let i = 0; i < n - 1; i++) {
+        const dt = times[i + 1] - times[i]; if (dt <= 0) continue;
+        const cl = (lats[i + 1] - lats[i]) / dt, co = (lons[i + 1] - lons[i]) / dt;
+        for (const [arr, ch] of [[ml, cl], [mo, co]]) {
+          for (const idx of [i, i + 1]) {
+            if (Math.abs(ch) > 1e-12) { const r = arr[idx] / ch; if (r < 0 || r > 1.5) arr[idx] = ch }
+            else if (Math.abs(arr[idx]) > 1e-12) arr[idx] = 0;
+          }
+        }
+      }
+      const step = 1 / hz;
+      const totalDur = times[n - 1], numSamples = Math.floor(totalDur * hz) + 1;
+      const result = []; let seg = 0;
+      for (let si = 0; si < numSamples; si++) {
+        const t = si * step;
+        while (seg < n - 2 && t > times[seg + 1]) seg++;
+        const dt = times[seg + 1] - times[seg], s = dt > 0 ? (t - times[seg]) / dt : 0;
+        const s2 = s * s, s3 = s2 * s;
+        const h00 = 2 * s3 - 3 * s2 + 1, h10 = s3 - 2 * s2 + s, h01 = -2 * s3 + 3 * s2, h11 = s3 - s2;
+        result.push({
+          lat: h00 * lats[seg] + h10 * dt * ml[seg] + h01 * lats[seg + 1] + h11 * dt * ml[seg + 1],
+          lon: h00 * lons[seg] + h10 * dt * mo[seg] + h01 * lons[seg + 1] + h11 * dt * mo[seg + 1],
+          alt: h00 * alts[seg] + h10 * dt * ma[seg] + h01 * alts[seg + 1] + h11 * dt * ma[seg + 1],
+          time: new Date(t0 + t * 1000)
         });
       }
+      return result;
     }
-  });
 
-  if (!offsets.length || !sizes.length) throw new Error('No metadata track found (track 3)');
-  log(`Found ${offsets.length} metadata chunks`);
-  setProgress(15);
-
-  // Read and concatenate metadata chunks
-  let totalSize = sizes.reduce((a,b)=>a+b, 0);
-  let metadata = new Uint8Array(totalSize);
-  let writePos = 0;
-  for (let i = 0; i < offsets.length; i++) {
-    const chunk = await readSlice(file, offsets[i], sizes[i]);
-    metadata.set(new Uint8Array(chunk.buffer), writePos);
-    writePos += sizes[i];
-    if (i % 10 === 0) setProgress(15 + (i/offsets.length)*15);
-  }
-  log(`Metadata extracted: ${totalSize} bytes`);
-  setProgress(30);
-  return metadata;
-}
-
-// ========== Protobuf Decoder ==========
-function pbDecode(buf, offset, end) {
-  const fields = {};
-  let pos = offset || 0;
-  const stop = end || buf.length;
-  while (pos < stop) {
-    const [tag, newPos] = pbVarint(buf, pos);
-    pos = newPos;
-    const fieldNum = tag >>> 3;
-    const wireType = tag & 7;
-    let value;
-    if (wireType === 0) { // varint
-      const [v, np] = pbVarint(buf, pos); pos = np; value = v;
-    } else if (wireType === 1) { // 64-bit
-      const dv = new DataView(buf.buffer, buf.byteOffset + pos, 8);
-      value = dv.getFloat64(0, true); pos += 8;
-    } else if (wireType === 2) { // length-delimited
-      const [len, np] = pbVarint(buf, pos); pos = np;
-      value = buf.subarray(pos, pos + len); pos += len;
-    } else if (wireType === 5) { // 32-bit
-      const dv = new DataView(buf.buffer, buf.byteOffset + pos, 4);
-      value = dv.getFloat32(0, true); pos += 4;
-    } else {
-      break; // unknown wire type
-    }
-    if (!fields[fieldNum]) fields[fieldNum] = [];
-    fields[fieldNum].push({wireType, value});
-  }
-  return fields;
-}
-
-function pbVarint(buf, pos) {
-  let result = 0, shift = 0;
-  while (pos < buf.length) {
-    const b = buf[pos++];
-    result |= (b & 0x7F) << shift;
-    if (!(b & 0x80)) break;
-    shift += 7;
-    if (shift > 35) break; // safety for uint32 range
-  }
-  return [result >>> 0, pos];
-}
-
-function pbGetMsg(fields, num) { const f=fields[num]; return f?pbDecode(f[0].value,0,f[0].value.length):null }
-function pbGetMsgAll(fields, num) { const f=fields[num]; return f?f.map(e=>pbDecode(e.value,0,e.value.length)):[] }
-function pbGetVarint(fields, num) { const f=fields[num]; return f?f[0].value:0 }
-function pbGetDouble(fields, num) { const f=fields[num]; return f?f[0].value:0 }
-function pbGetString(fields, num) { const f=fields[num]; return f?new TextDecoder().decode(f[0].value):'' }
-
-function extractGPS(metadata) {
-  log('Decoding protobuf...');
-  const root = pbDecode(metadata, 0, metadata.length);
-
-  // Check camera model
-  const globalInfo = pbGetMsg(root, 1);
-  if (globalInfo) {
-    const modules = pbGetMsgAll(globalInfo, 1);
-    if (modules.length) {
-      const camName = pbGetString(modules[0], 10);
-      const sn = pbGetString(modules[0], 5);
-      log(`Camera: ${camName}${sn?' (SN: '+sn+')':''}`);
-    }
-  }
-
-  // Extract GPS points: root.3[].4.2.{1.{2,3}, 2, 6.1}
-  const gpsEntries = pbGetMsgAll(root, 3);
-  log(`Raw GPS entries: ${gpsEntries.length}`);
-  const points = [];
-  for (const entry of gpsEntries) {
-    try {
-      const remoteGps = pbGetMsg(entry, 4); if (!remoteGps) continue;
-      const coords = pbGetMsg(remoteGps, 2); if (!coords) continue;
-      const info = pbGetMsg(coords, 1); if (!info) continue;
-      const lat = pbGetDouble(info, 2);
-      const lon = pbGetDouble(info, 3);
-      const altMm = pbGetVarint(coords, 2);
-      const dtMsg = pbGetMsg(coords, 6);
-      const dtStr = dtMsg ? pbGetString(dtMsg, 1) : '';
-      if (lat === 0 && lon === 0) continue;
-      points.push({ lat, lon, alt: altMm / 1000, time: new Date(dtStr) });
-    } catch(e) { continue; }
-  }
-  log(`Valid GPS points: ${points.length}`);
-  return points;
-}
-
-// ========== GPS Processing ==========
-const R = 6371000;
-function haversine(lat1,lon1,lat2,lon2) {
-  const p1=lat1*Math.PI/180, p2=lat2*Math.PI/180, dp=(lat2-lat1)*Math.PI/180, dl=(lon2-lon1)*Math.PI/180;
-  const a=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
-  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
-}
-function bearing(lat1,lon1,lat2,lon2) {
-  const p1=lat1*Math.PI/180, p2=lat2*Math.PI/180, dl=(lon2-lon1)*Math.PI/180;
-  const x=Math.sin(dl)*Math.cos(p2), y=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
-  return ((Math.atan2(x,y)*180/Math.PI)+360)%360;
-}
-
-function deduplicate(pts) {
-  if(!pts.length) return [];
-  const r=[pts[0]];
-  for(let i=1;i<pts.length;i++) if(pts[i].lat!==r[r.length-1].lat||pts[i].lon!==r[r.length-1].lon) r.push(pts[i]);
-  return r;
-}
-
-function assignTimestamps(pts) {
-  if(pts.length<2) return;
-  const groups=[]; let cur=[0];
-  for(let i=1;i<pts.length;i++){
-    const cs=Math.floor(pts[i].time.getTime()/1000), gs=Math.floor(pts[cur[0]].time.getTime()/1000);
-    if(cs===gs) cur.push(i); else { groups.push(cur); cur=[i]; }
-  }
-  groups.push(cur);
-  for(const g of groups){
-    const n=g.length, base=Math.floor(pts[g[0]].time.getTime()/1000)*1000;
-    for(let j=0;j<n;j++) pts[g[j]].time=new Date(base+j/n*1000);
-  }
-}
-
-function smoothGPS(pts, window) {
-  if(pts.length<3) return pts;
-  const n=pts.length, halfMax=Math.floor(window/2);
-  // Pre-calc speeds, accels, heading rates
-  const spd=new Float64Array(n), acc=new Float64Array(n), hr=new Float64Array(n);
-  for(let i=1;i<n;i++){
-    const dt=(pts[i].time-pts[i-1].time)/1000;
-    if(dt>0) spd[i]=haversine(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon)/dt;
-    else spd[i]=spd[i-1];
-  }
-  spd[0]=spd[1]||0;
-  for(let i=1;i<n;i++){const dt=(pts[i].time-pts[i-1].time)/1000; if(dt>0) acc[i]=Math.abs(spd[i]-spd[i-1])/dt}
-  acc[0]=acc[1]||0;
-  let prevH=0;
-  for(let i=1;i<n;i++){
-    const h=bearing(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon);
-    if(i===1) prevH=h;
-    let d=Math.abs(h-prevH); if(d>180) d=360-d;
-    hr[i]=d; prevH=h;
-  }
-  hr[0]=hr[1]||0;
-  // Pre-smooth
-  const hrs=Float64Array.from(hr), acs=Float64Array.from(acc);
-  for(let i=2;i<n-2;i++){hrs[i]=(hr[i-2]+hr[i-1]+hr[i]+hr[i+1]+hr[i+2])/5; acs[i]=(acc[i-2]+acc[i-1]+acc[i]+acc[i+1]+acc[i+2])/5}
-
-  const result=[];
-  for(let i=0;i<n;i++){
-    let effH;
-    if(acs[i]>19.6) effH=halfMax;
-    else { const s=Math.max(0,1-hrs[i]/3); effH=Math.floor(halfMax*s); }
-    if(effH===0){result.push({...pts[i]});continue}
-    const start=Math.max(0,i-effH), end=Math.min(n,i+effH+1);
-    const sigma=Math.max(effH/2,.5);
-    let wSum=0, aLat=0, aLon=0, aAlt=0;
-    for(let j=start;j<end;j++){const w=Math.exp(-.5*((j-i)/sigma)**2); wSum+=w; aLat+=pts[j].lat*w; aLon+=pts[j].lon*w; aAlt+=pts[j].alt*w}
-    result.push({lat:aLat/wSum, lon:aLon/wSum, alt:aAlt/wSum, time:pts[i].time});
-  }
-  return result;
-}
-
-function interpolateHz(pts, hz) {
-  if(pts.length<2) return pts;
-  hz = hz || 100;
-  const n=pts.length, t0=pts[0].time.getTime();
-  const times=pts.map(p=>(p.time.getTime()-t0)/1000);
-  const lats=pts.map(p=>p.lat), lons=pts.map(p=>p.lon), alts=pts.map(p=>p.alt);
-  // Catmull-Rom tangents
-  const ml=new Float64Array(n), mo=new Float64Array(n), ma=new Float64Array(n);
-  for(let i=1;i<n-1;i++){const dt=times[i+1]-times[i-1]; if(dt>0){ml[i]=(lats[i+1]-lats[i-1])/dt; mo[i]=(lons[i+1]-lons[i-1])/dt; ma[i]=(alts[i+1]-alts[i-1])/dt}}
-  if(times[1]-times[0]>0){const d=times[1]-times[0]; ml[0]=(lats[1]-lats[0])/d; mo[0]=(lons[1]-lons[0])/d; ma[0]=(alts[1]-alts[0])/d}
-  if(times[n-1]-times[n-2]>0){const d=times[n-1]-times[n-2]; ml[n-1]=(lats[n-1]-lats[n-2])/d; mo[n-1]=(lons[n-1]-lons[n-2])/d; ma[n-1]=(alts[n-1]-alts[n-2])/d}
-  // Clamp tangents
-  for(let i=0;i<n-1;i++){
-    const dt=times[i+1]-times[i]; if(dt<=0)continue;
-    const cl=(lats[i+1]-lats[i])/dt, co=(lons[i+1]-lons[i])/dt;
-    for(const [arr,ch] of [[ml,cl],[mo,co]]){
-      for(const idx of [i,i+1]){
-        if(Math.abs(ch)>1e-12){const r=arr[idx]/ch; if(r<0||r>1.5) arr[idx]=ch}
-        else if(Math.abs(arr[idx])>1e-12) arr[idx]=0;
+    function computeSpeedHeading(pts) {
+      const n = pts.length, speeds = new Float64Array(n), headings = new Float64Array(n);
+      for (let i = 1; i < n; i++) {
+        const dt = (pts[i].time - pts[i - 1].time) / 1000;
+        const d = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+        speeds[i] = dt > 0 ? d / dt : speeds[i - 1];
+        headings[i] = d > 0.01 ? bearing(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon) : headings[i - 1];
       }
+      if (n > 1) headings[0] = headings[1];
+      // Speed smoothing (~500ms window)
+      if (n > 10) {
+        const avgDt = (pts[n - 1].time - pts[0].time) / 1000 / (n - 1);
+        const half = Math.max(2, Math.round(.25 / avgDt)), sigma = half / 2;
+        const raw = Float64Array.from(speeds);
+        for (let i = 0; i < n; i++) {
+          const s = Math.max(0, i - half), e = Math.min(n, i + half + 1);
+          let wSum = 0, vSum = 0;
+          for (let j = s; j < e; j++) { const w = Math.exp(-.5 * ((j - i) / sigma) ** 2); wSum += w; vSum += raw[j] * w }
+          speeds[i] = vSum / wSum;
+        }
+      }
+      return { speeds, headings };
     }
-  }
-  const step=1/hz;
-  const totalDur=times[n-1], numSamples=Math.floor(totalDur*hz)+1;
-  const result=[]; let seg=0;
-  for(let si=0;si<numSamples;si++){
-    const t=si*step;
-    while(seg<n-2&&t>times[seg+1]) seg++;
-    const dt=times[seg+1]-times[seg], s=dt>0?(t-times[seg])/dt:0;
-    const s2=s*s, s3=s2*s;
-    const h00=2*s3-3*s2+1, h10=s3-2*s2+s, h01=-2*s3+3*s2, h11=s3-s2;
-    result.push({
-      lat:h00*lats[seg]+h10*dt*ml[seg]+h01*lats[seg+1]+h11*dt*ml[seg+1],
-      lon:h00*lons[seg]+h10*dt*mo[seg]+h01*lons[seg+1]+h11*dt*mo[seg+1],
-      alt:h00*alts[seg]+h10*dt*ma[seg]+h01*alts[seg+1]+h11*dt*ma[seg+1],
-      time:new Date(t0+t*1000)
-    });
-  }
-  return result;
-}
-
-function computeSpeedHeading(pts) {
-  const n=pts.length, speeds=new Float64Array(n), headings=new Float64Array(n);
-  for(let i=1;i<n;i++){
-    const dt=(pts[i].time-pts[i-1].time)/1000;
-    const d=haversine(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon);
-    speeds[i]=dt>0?d/dt:speeds[i-1];
-    headings[i]=d>0.01?bearing(pts[i-1].lat,pts[i-1].lon,pts[i].lat,pts[i].lon):headings[i-1];
-  }
-  if(n>1) headings[0]=headings[1];
-  // Speed smoothing (~500ms window)
-  if(n>10){
-    const avgDt=(pts[n-1].time-pts[0].time)/1000/(n-1);
-    const half=Math.max(2,Math.round(.25/avgDt)), sigma=half/2;
-    const raw=Float64Array.from(speeds);
-    for(let i=0;i<n;i++){
-      const s=Math.max(0,i-half), e=Math.min(n,i+half+1);
-      let wSum=0, vSum=0;
-      for(let j=s;j<e;j++){const w=Math.exp(-.5*((j-i)/sigma)**2); wSum+=w; vSum+=raw[j]*w}
-      speeds[i]=vSum/wSum;
-    }
-  }
-  return {speeds, headings};
-}
-
-// GCJ-02
-const GCJ_A=6378245, GCJ_EE=0.00669342162296594323;
-function inChina(lat,lon){return lat>=0.8293&&lat<=55.8271&&lon>=72.004&&lon<=137.8347}
-function txLat(x,y){let r=-100+2*x+3*y+.2*y*y+.1*x*y+.2*Math.sqrt(Math.abs(x));r+=(20*Math.sin(6*x*Math.PI)+20*Math.sin(2*x*Math.PI))*2/3;r+=(20*Math.sin(y*Math.PI)+40*Math.sin(y/3*Math.PI))*2/3;r+=(160*Math.sin(y/12*Math.PI)+320*Math.sin(y*Math.PI/30))*2/3;return r}
-function txLon(x,y){let r=300+x+2*y+.1*x*x+.1*x*y+.1*Math.sqrt(Math.abs(x));r+=(20*Math.sin(6*x*Math.PI)+20*Math.sin(2*x*Math.PI))*2/3;r+=(20*Math.sin(x*Math.PI)+40*Math.sin(x/3*Math.PI))*2/3;r+=(150*Math.sin(x/12*Math.PI)+300*Math.sin(x/30*Math.PI))*2/3;return r}
-function wgs2gcj(lat,lon){
-  if(!inChina(lat,lon))return[lat,lon];
-  let dl=txLat(lon-105,lat-35), dn=txLon(lon-105,lat-35);
-  const rl=lat/180*Math.PI, m=Math.sin(rl), mg=1-GCJ_EE*m*m, sq=Math.sqrt(mg);
-  dl=dl*180/((GCJ_A*(1-GCJ_EE))/(mg*sq)*Math.PI); dn=dn*180/(GCJ_A/sq*Math.cos(rl)*Math.PI);
-  return[lat+dl,lon+dn];
-}
-
-// NMEA
-function nmeaChecksum(s){let c=0;for(let i=0;i<s.length;i++)c^=s.charCodeAt(i);return c.toString(16).toUpperCase().padStart(2,'0')}
-function degToNmea(deg,isLon){
-  const sign=deg>=0; deg=Math.abs(deg);
-  const d=Math.floor(deg), m=(deg-d)*60;
-  const coord=isLon?String(d).padStart(3,'0')+m.toFixed(4).padStart(7,'0'):String(d).padStart(2,'0')+m.toFixed(4).padStart(7,'0');
-  const hemi=isLon?(sign?'E':'W'):(sign?'N':'S');
-  return[coord,hemi];
-}
-
-function generateNMEA(pts, speeds, headings) {
-  const lines = [];
-  for(let i=0;i<pts.length;i++){
-    const p=pts[i], d=p.time;
-    const ts=String(d.getUTCHours()).padStart(2,'0')+String(d.getUTCMinutes()).padStart(2,'0')+String(d.getUTCSeconds()).padStart(2,'0')+'.'+String(Math.floor(d.getUTCMilliseconds()/10)).padStart(2,'0');
-    const ds=String(d.getUTCDate()).padStart(2,'0')+String(d.getUTCMonth()+1).padStart(2,'0')+String(d.getUTCFullYear()%100).padStart(2,'0');
-    const[latC,latH]=degToNmea(p.lat,false), [lonC,lonH]=degToNmea(p.lon,true);
-    const spdKn=(speeds[i]*3600/1852).toFixed(2), hdg=headings[i].toFixed(2);
-    const rmc=`GPRMC,${ts},A,${latC},${latH},${lonC},${lonH},${spdKn},${hdg},${ds},,,A`;
-    lines.push(`$${rmc}*${nmeaChecksum(rmc)}`);
-    const gga=`GPGGA,${ts},${latC},${latH},${lonC},${lonH},1,10,1.0,${p.alt.toFixed(1)},M,0.0,M,,`;
-    lines.push(`$${gga}*${nmeaChecksum(gga)}`);
-  }
-  return lines.join('\r\n')+'\r\n';
-}
-
-// ========== Main ==========
-async function run() {
-  logEl.textContent=''; logEl.style.display='block';
-  btnConvert.disabled=true; btnDownload.classList.add('hidden');
-  try {
-    const metadata = await parseMP4(selectedFile);
-    setProgress(35);
-
-    let pts = extractGPS(metadata);
-    if(!pts.length) throw new Error('No GPS data found');
-    setProgress(40);
-
-    log(`Raw points: ${pts.length}`);
-    pts = deduplicate(pts);
-    log(`After dedup: ${pts.length} (~10Hz)`);
-    assignTimestamps(pts);
-    setProgress(50);
-
-    if(chkSmooth.checked) {
-      let w = parseInt(smoothWindow.value);
-      if(w%2===0) w++;
-      pts = smoothGPS(pts, w);
-      log(`Smoothed (window=${w})`);
-    }
-    setProgress(60);
-
-    if(chk100hz.checked) {
-      const hz = parseInt(hzValue.value);
-      pts = interpolateHz(pts, hz);
-      log(`Interpolated to ${hz}Hz: ${pts.length} points`);
-    }
-    setProgress(70);
-
-    const{speeds,headings}=computeSpeedHeading(pts);
-    log('Speed/heading computed');
-    setProgress(80);
 
     // GCJ-02
-    if(pts.length && inChina(pts[0].lat, pts[0].lon)){
-      log('Applying GCJ-02 offset...');
-      for(const p of pts){const[la,lo]=wgs2gcj(p.lat,p.lon);p.lat=la;p.lon=lo}
+    const GCJ_A = 6378245, GCJ_EE = 0.00669342162296594323;
+    function inChina(lat, lon) { return lat >= 0.8293 && lat <= 55.8271 && lon >= 72.004 && lon <= 137.8347 }
+    function txLat(x, y) { let r = -100 + 2 * x + 3 * y + .2 * y * y + .1 * x * y + .2 * Math.sqrt(Math.abs(x)); r += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3; r += (20 * Math.sin(y * Math.PI) + 40 * Math.sin(y / 3 * Math.PI)) * 2 / 3; r += (160 * Math.sin(y / 12 * Math.PI) + 320 * Math.sin(y * Math.PI / 30)) * 2 / 3; return r }
+    function txLon(x, y) { let r = 300 + x + 2 * y + .1 * x * x + .1 * x * y + .1 * Math.sqrt(Math.abs(x)); r += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3; r += (20 * Math.sin(x * Math.PI) + 40 * Math.sin(x / 3 * Math.PI)) * 2 / 3; r += (150 * Math.sin(x / 12 * Math.PI) + 300 * Math.sin(x / 30 * Math.PI)) * 2 / 3; return r }
+    function wgs2gcj(lat, lon) {
+      if (!inChina(lat, lon)) return [lat, lon];
+      let dl = txLat(lon - 105, lat - 35), dn = txLon(lon - 105, lat - 35);
+      const rl = lat / 180 * Math.PI, m = Math.sin(rl), mg = 1 - GCJ_EE * m * m, sq = Math.sqrt(mg);
+      dl = dl * 180 / ((GCJ_A * (1 - GCJ_EE)) / (mg * sq) * Math.PI); dn = dn * 180 / (GCJ_A / sq * Math.cos(rl) * Math.PI);
+      return [lat + dl, lon + dn];
     }
-    setProgress(90);
 
-    const nmea = generateNMEA(pts, speeds, headings);
-    nmeaBlob = new Blob([nmea], {type:'application/octet-stream'});
-    nmeaName = selectedFile.name.replace(/\.[^.]+$/,'.nmea');
-    setProgress(100);
+    // NMEA
+    function nmeaChecksum(s) { let c = 0; for (let i = 0; i < s.length; i++)c ^= s.charCodeAt(i); return c.toString(16).toUpperCase().padStart(2, '0') }
+    function degToNmea(deg, isLon) {
+      const sign = deg >= 0; deg = Math.abs(deg);
+      const d = Math.floor(deg), m = (deg - d) * 60;
+      const coord = isLon ? String(d).padStart(3, '0') + m.toFixed(4).padStart(7, '0') : String(d).padStart(2, '0') + m.toFixed(4).padStart(7, '0');
+      const hemi = isLon ? (sign ? 'E' : 'W') : (sign ? 'N' : 'S');
+      return [coord, hemi];
+    }
 
-    log(`\nDone! ${pts.length} points, ${(nmeaBlob.size/1024).toFixed(0)} KB`);
-    btnDownload.classList.remove('hidden');
-  } catch(e) {
-    log(`ERROR: ${e.message}`);
-  }
-  btnConvert.disabled=false;
-}
-</script>
+    function generateNMEA(pts, speeds, headings) {
+      const lines = [];
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i], d = p.time;
+        const ts = String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + String(d.getUTCSeconds()).padStart(2, '0') + '.' + String(Math.floor(d.getUTCMilliseconds() / 10)).padStart(2, '0');
+        const ds = String(d.getUTCDate()).padStart(2, '0') + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCFullYear() % 100).padStart(2, '0');
+        const [latC, latH] = degToNmea(p.lat, false), [lonC, lonH] = degToNmea(p.lon, true);
+        const spdKn = (speeds[i] * 3600 / 1852).toFixed(2), hdg = headings[i].toFixed(2);
+        const rmc = `GPRMC,${ts},A,${latC},${latH},${lonC},${lonH},${spdKn},${hdg},${ds},,,A`;
+        lines.push(`$${rmc}*${nmeaChecksum(rmc)}`);
+        const gga = `GPGGA,${ts},${latC},${latH},${lonC},${lonH},1,10,1.0,${p.alt.toFixed(1)},M,0.0,M,,`;
+        lines.push(`$${gga}*${nmeaChecksum(gga)}`);
+      }
+      return lines.join('\r\n') + '\r\n';
+    }
+
+    // ========== Main ==========
+    async function run() {
+      const file = selectedFile;
+      cancelled = false;
+      running = true;
+      goatcounter.count({ path: 'convert', title: 'Convert', event: true });
+      logEl.textContent = ''; logEl.style.display = 'block';
+      progressBar.style.width = '0%';
+      btnDownload.classList.add('hidden');
+      try {
+        log(`Converting: ${file.name}`);
+        const metadata = await parseMP4(file);
+
+        let pts = extractGPS(metadata);
+        if (!pts.length) throw new Error('No GPS data found');
+
+        log(`Raw points: ${pts.length}`);
+        pts = deduplicate(pts);
+        log(`After dedup: ${pts.length} (~10Hz)`);
+        assignTimestamps(pts);
+
+        if (chkSmooth.checked) {
+          let w = parseInt(smoothWindow.value);
+          if (w % 2 === 0) w++;
+          pts = smoothGPS(pts, w);
+          log(`Smoothed (window=${w})`);
+        }
+
+        if (chk100hz.checked) {
+          const hz = parseInt(hzValue.value);
+          pts = interpolateHz(pts, hz);
+          log(`Interpolated to ${hz}Hz: ${pts.length} points`);
+        }
+
+        const { speeds, headings } = computeSpeedHeading(pts);
+        log('Speed/heading computed');
+
+        // GCJ-02
+        if (pts.length && inChina(pts[0].lat, pts[0].lon)) {
+          log('Applying GCJ-02 offset...');
+          for (const p of pts) { const [la, lo] = wgs2gcj(p.lat, p.lon); p.lat = la; p.lon = lo }
+        }
+
+        const nmea = generateNMEA(pts, speeds, headings);
+        nmeaBlob = new Blob([nmea], { type: 'application/octet-stream' });
+        nmeaName = file.name.replace(/\.[^.]+$/, '.nmea');
+
+        log(`\nDone! ${pts.length} points, ${(nmeaBlob.size / 1024).toFixed(0)} KB`);
+        btnDownload.classList.remove('hidden');
+      } catch (e) {
+        if (e.message === 'Cancelled') return;
+        log(`ERROR: ${e.message}`);
+      }
+      running = false;
+      btnConvert.disabled = false;
+    }
+  </script>
+  <script data-goatcounter="https://dji2racechrono.goatcounter.com/count"
+    async src="//gc.zgo.at/count.js"></script>
 </body>
+
 </html>
