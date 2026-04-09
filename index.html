@@ -195,6 +195,7 @@
 
 <script>
     // ========== UI ==========
+    const sharedTextDecoder = new TextDecoder();
     const $ = id => document.getElementById(id);
     const fileInput = $('fileInput');
     const btnFile = $('btnFile');
@@ -386,14 +387,25 @@
         let totalSize = sizes.reduce((a, b) => a + b, 0);
         let metadata = new Uint8Array(totalSize);
         let writePos = 0;
-        for (let i = 0; i < offsets.length; i++) {
+        const BATCH = 100;
+        for (let i = 0; i < offsets.length; i += BATCH) {
             if (cancelled) {
                 throw new Error('Cancelled');
             }
-            const chunk = await readSlice(file, offsets[i], sizes[i]);
-            metadata.set(new Uint8Array(chunk.buffer), writePos);
-            writePos += sizes[i];
-            setProgress((i / offsets.length) * 99);
+            const end = Math.min(i + BATCH, offsets.length);
+            const promises = [];
+            for (let j = i; j < end; j++) {
+                promises.push(
+                    readSlice(file, offsets[j], sizes[j])
+                        .then(dv => new Uint8Array(dv.buffer))
+                );
+            }
+            const results = await Promise.all(promises);
+            for (let k = 0; k < results.length; k++) {
+                metadata.set(results[k], writePos);
+                writePos += sizes[i + k];
+            }
+            setProgress((end / offsets.length) * 99);
         }
         log(`Metadata extracted: ${totalSize} bytes`);
         return metadata;
@@ -476,7 +488,7 @@
 
     function pbGetString(fields, num) {
         const f = fields[num];
-        return f ? new TextDecoder().decode(f[0].value) : ''
+        return f ? sharedTextDecoder.decode(f[0].value) : ''
     }
 
     function extractGPS(metadata) {
@@ -520,7 +532,7 @@
                 if (lat === 0 && lon === 0) {
                     continue;
                 }
-                points.push({lat, lon, alt: altMm / 1000, time: new Date(dtStr)});
+                points.push({lat, lon, alt: altMm / 1000, time: new Date(dtStr).getTime()});
             } catch (e) {
                 continue;
             }
@@ -564,7 +576,7 @@
         const groups = [];
         let cur = [0];
         for (let i = 1; i < pts.length; i++) {
-            const cs = Math.floor(pts[i].time.getTime() / 1000), gs = Math.floor(pts[cur[0]].time.getTime() / 1000);
+            const cs = Math.floor(pts[i].time / 1000), gs = Math.floor(pts[cur[0]].time / 1000);
             if (cs === gs) {
                 cur.push(i);
             } else {
@@ -574,9 +586,9 @@
         }
         groups.push(cur);
         for (const g of groups) {
-            const n = g.length, base = Math.floor(pts[g[0]].time.getTime() / 1000) * 1000;
+            const n = g.length, base = Math.floor(pts[g[0]].time / 1000) * 1000;
             for (let j = 0; j < n; j++) {
-                pts[g[j]].time = new Date(base + j / n * 1000);
+                pts[g[j]].time = Math.trunc(base + j / n * 1000);
             }
         }
     }
@@ -588,35 +600,36 @@
         const n = pts.length, halfMax = Math.floor(window / 2);
         // Pre-calc speeds, accels, heading rates
         const spd = new Float64Array(n), acc = new Float64Array(n), hr = new Float64Array(n);
+        const D2R_S = Math.PI / 180;
+        let prevH = 0;
         for (let i = 1; i < n; i++) {
             const dt = (pts[i].time - pts[i - 1].time) / 1000;
-            if (dt > 0) {
-                spd[i] = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon) / dt;
-            } else {
-                spd[i] = spd[i - 1];
-            }
+            const p1 = pts[i - 1].lat * D2R_S, p2 = pts[i].lat * D2R_S;
+            const dp = (pts[i].lat - pts[i - 1].lat) * D2R_S;
+            const dl = (pts[i].lon - pts[i - 1].lon) * D2R_S;
+            const cp1 = Math.cos(p1), cp2 = Math.cos(p2);
+            const sp1 = Math.sin(p1), sp2 = Math.sin(p2);
+            const sdh = Math.sin(dp / 2), sdl = Math.sin(dl / 2);
+            const a = sdh ** 2 + cp1 * cp2 * sdl ** 2;
+            const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            spd[i] = dt > 0 ? dist / dt : spd[i - 1];
+            const x = Math.sin(dl) * cp2;
+            const y = cp1 * sp2 - sp1 * cp2 * Math.cos(dl);
+            const h = ((Math.atan2(x, y) * 180 / Math.PI) + 360) % 360;
+            if (i === 1) prevH = h;
+            let hd = Math.abs(h - prevH);
+            if (hd > 180) hd = 360 - hd;
+            hr[i] = hd;
+            prevH = h;
         }
         spd[0] = spd[1] || 0;
         for (let i = 1; i < n; i++) {
             const dt = (pts[i].time - pts[i - 1].time) / 1000;
             if (dt > 0) {
-                acc[i] = Math.abs(spd[i] - spd[i - 1]) / dt
+                acc[i] = Math.abs(spd[i] - spd[i - 1]) / dt;
             }
         }
         acc[0] = acc[1] || 0;
-        let prevH = 0;
-        for (let i = 1; i < n; i++) {
-            const h = bearing(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
-            if (i === 1) {
-                prevH = h;
-            }
-            let d = Math.abs(h - prevH);
-            if (d > 180) {
-                d = 360 - d;
-            }
-            hr[i] = d;
-            prevH = h;
-        }
         hr[0] = hr[1] || 0;
         // Pre-smooth
         const hrs = Float64Array.from(hr), acs = Float64Array.from(acc);
@@ -658,8 +671,8 @@
             return pts;
         }
         hz = hz || 100;
-        const n = pts.length, t0 = pts[0].time.getTime();
-        const times = pts.map(p => (p.time.getTime() - t0) / 1000);
+        const n = pts.length, t0 = pts[0].time;
+        const times = pts.map(p => (p.time - t0) / 1000);
         const lats = pts.map(p => p.lat), lons = pts.map(p => p.lon), alts = pts.map(p => p.alt);
         // Catmull-Rom tangents
         const ml = new Float64Array(n), mo = new Float64Array(n), ma = new Float64Array(n);
@@ -719,7 +732,7 @@
                 lat: h00 * lats[seg] + h10 * dt * ml[seg] + h01 * lats[seg + 1] + h11 * dt * ml[seg + 1],
                 lon: h00 * lons[seg] + h10 * dt * mo[seg] + h01 * lons[seg + 1] + h11 * dt * mo[seg + 1],
                 alt: h00 * alts[seg] + h10 * dt * ma[seg] + h01 * alts[seg + 1] + h11 * dt * ma[seg + 1],
-                time: new Date(t0 + t * 1000)
+                time: Math.trunc(t0 + t * 1000)
             });
         }
         return result;
@@ -727,11 +740,25 @@
 
     function computeSpeedHeading(pts) {
         const n = pts.length, speeds = new Float64Array(n), headings = new Float64Array(n);
+        const D2R_C = Math.PI / 180;
         for (let i = 1; i < n; i++) {
             const dt = (pts[i].time - pts[i - 1].time) / 1000;
-            const d = haversine(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+            const p1 = pts[i - 1].lat * D2R_C, p2 = pts[i].lat * D2R_C;
+            const dp = (pts[i].lat - pts[i - 1].lat) * D2R_C;
+            const dl = (pts[i].lon - pts[i - 1].lon) * D2R_C;
+            const cp1 = Math.cos(p1), cp2 = Math.cos(p2);
+            const sp1 = Math.sin(p1), sp2 = Math.sin(p2);
+            const sdh = Math.sin(dp / 2), sdl = Math.sin(dl / 2);
+            const a = sdh ** 2 + cp1 * cp2 * sdl ** 2;
+            const d = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
             speeds[i] = dt > 0 ? d / dt : speeds[i - 1];
-            headings[i] = d > 0.01 ? bearing(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon) : headings[i - 1];
+            if (d > 0.01) {
+                const x = Math.sin(dl) * cp2;
+                const y = cp1 * sp2 - sp1 * cp2 * Math.cos(dl);
+                headings[i] = ((Math.atan2(x, y) * 180 / Math.PI) + 360) % 360;
+            } else {
+                headings[i] = headings[i - 1];
+            }
         }
         if (n > 1) {
             headings[0] = headings[1];
@@ -740,14 +767,18 @@
         if (n > 10) {
             const avgDt = (pts[n - 1].time - pts[0].time) / 1000 / (n - 1);
             const half = Math.max(2, Math.round(.25 / avgDt)), sigma = half / 2;
+            const gaussW = new Float64Array(half + 1);
+            for (let d = 0; d <= half; d++) {
+                gaussW[d] = Math.exp(-0.5 * (d / sigma) ** 2);
+            }
             const raw = Float64Array.from(speeds);
             for (let i = 0; i < n; i++) {
                 const s = Math.max(0, i - half), e = Math.min(n, i + half + 1);
                 let wSum = 0, vSum = 0;
                 for (let j = s; j < e; j++) {
-                    const w = Math.exp(-.5 * ((j - i) / sigma) ** 2);
+                    const w = gaussW[Math.abs(j - i)];
                     wSum += w;
-                    vSum += raw[j] * w
+                    vSum += raw[j] * w;
                 }
                 speeds[i] = vSum / wSum;
             }
@@ -802,23 +833,24 @@
         const sign = deg >= 0;
         deg = Math.abs(deg);
         const d = Math.floor(deg), m = (deg - d) * 60;
-        const coord = isLon ? String(d).padStart(3, '0') + m.toFixed(4).padStart(7, '0') : String(d).padStart(2, '0') + m.toFixed(4).padStart(7, '0');
+        const coord = isLon ? String(d).padStart(3, '0') + m.toFixed(5).padStart(8, '0') : String(d).padStart(2, '0') + m.toFixed(5).padStart(8, '0');
         const hemi = isLon ? (sign ? 'E' : 'W') : (sign ? 'N' : 'S');
         return [coord, hemi];
     }
 
     function generateNMEA(pts, speeds, headings) {
-        const lines = [];
+        const lines = new Array(pts.length * 2);
+        let li = 0;
         for (let i = 0; i < pts.length; i++) {
-            const p = pts[i], d = p.time;
-            const ts = String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + String(d.getUTCSeconds()).padStart(2, '0') + '.' + String(Math.floor(d.getUTCMilliseconds() / 10)).padStart(2, '0');
+            const p = pts[i], d = new Date(p.time);
+            const ts = String(d.getUTCHours()).padStart(2, '0') + String(d.getUTCMinutes()).padStart(2, '0') + String(d.getUTCSeconds()).padStart(2, '0') + '.' + String(d.getUTCMilliseconds()).padStart(3, '0');
             const ds = String(d.getUTCDate()).padStart(2, '0') + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCFullYear() % 100).padStart(2, '0');
             const [latC, latH] = degToNmea(p.lat, false), [lonC, lonH] = degToNmea(p.lon, true);
             const spdKn = (speeds[i] * 3600 / 1852).toFixed(2), hdg = headings[i].toFixed(2);
             const rmc = `GPRMC,${ts},A,${latC},${latH},${lonC},${lonH},${spdKn},${hdg},${ds},,,A`;
-            lines.push(`$${rmc}*${nmeaChecksum(rmc)}`);
+            lines[li++] = `$${rmc}*${nmeaChecksum(rmc)}`;
             const gga = `GPGGA,${ts},${latC},${latH},${lonC},${lonH},1,10,1.0,${p.alt.toFixed(1)},M,0.0,M,,`;
-            lines.push(`$${gga}*${nmeaChecksum(gga)}`);
+            lines[li++] = `$${gga}*${nmeaChecksum(gga)}`;
         }
         return lines.join('\r\n') + '\r\n';
     }
