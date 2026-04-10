@@ -347,6 +347,24 @@
             return results;
         }
 
+        // Extract video duration from mvhd
+        let videoDurationMs = 0;
+        const mvhdBoxes = findBoxes(moovArr, 0, moovArr.length, 'mvhd');
+        if (mvhdBoxes.length) {
+            const [mvs, mve] = mvhdBoxes[0];
+            const mvhdDv = new DataView(moovArr.buffer, moovArr.byteOffset + mvs);
+            const ver = mvhdDv.getUint8(0);
+            let timescale, dur;
+            if (ver === 0) {
+                timescale = mvhdDv.getUint32(12);
+                dur = mvhdDv.getUint32(16);
+            } else {
+                timescale = mvhdDv.getUint32(20);
+                dur = Number(mvhdDv.getBigUint64(24));
+            }
+            videoDurationMs = dur / timescale * 1000;
+        }
+
         // Walk moov → trak(3) → mdia → minf → stbl → co64/stco + stsz
         const traks = findBoxes(moovArr, 0, moovArr.length, 'trak');
         if (traks.length >= 3) {
@@ -408,7 +426,7 @@
             setProgress((end / offsets.length) * 99);
         }
         log(`Metadata extracted: ${totalSize} bytes`);
-        return metadata;
+        return {metadata, videoDurationMs};
     }
 
     // ========== Protobuf Decoder ==========
@@ -510,7 +528,10 @@
         const gpsEntries = pbGetMsgAll(root, 3);
         log(`Raw GPS entries: ${gpsEntries.length}`);
         const points = [];
-        for (const entry of gpsEntries) {
+        let firstValidIndex = -1;
+        let lastValidIndex = -1;
+        for (let i = 0; i < gpsEntries.length; i++) {
+            const entry = gpsEntries[i];
             try {
                 const remoteGps = pbGetMsg(entry, 4);
                 if (!remoteGps) {
@@ -532,13 +553,17 @@
                 if (lat === 0 && lon === 0) {
                     continue;
                 }
+                if (firstValidIndex < 0) {
+                    firstValidIndex = i;
+                }
+                lastValidIndex = i;
                 points.push({lat, lon, alt: altMm / 1000, time: new Date(dtStr).getTime()});
             } catch (e) {
                 continue;
             }
         }
         log(`Valid GPS points: ${points.length}`);
-        return points;
+        return {points, totalEntries: gpsEntries.length, firstValidIndex, lastValidIndex};
     }
 
     // ========== GPS Processing ==========
@@ -820,6 +845,38 @@
         return [lat + dl, lon + dn];
     }
 
+    function padToVideoDuration(pts, speeds, headings, videoStartMs, videoEndMs, hz) {
+        const stepMs = 1000 / hz;
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        const pre = [];
+        const post = [];
+        for (let t = videoStartMs; t < first.time - stepMs / 2; t += stepMs) {
+            pre.push({lat: first.lat, lon: first.lon, alt: first.alt, time: Math.trunc(t)});
+        }
+        for (let t = last.time + stepMs; t <= videoEndMs + stepMs / 2; t += stepMs) {
+            post.push({lat: last.lat, lon: last.lon, alt: last.alt, time: Math.trunc(t)});
+        }
+        if (!pre.length && !post.length) {
+            return {pts, speeds, headings};
+        }
+        const newPts = [...pre, ...pts, ...post];
+        const n = newPts.length;
+        const newSpeeds = new Float64Array(n);
+        const newHeadings = new Float64Array(n);
+        for (let i = 0; i < pre.length; i++) {
+            newHeadings[i] = headings[0];
+        }
+        for (let i = 0; i < pts.length; i++) {
+            newSpeeds[pre.length + i] = speeds[i];
+            newHeadings[pre.length + i] = headings[i];
+        }
+        for (let i = 0; i < post.length; i++) {
+            newHeadings[pre.length + pts.length + i] = headings[headings.length - 1];
+        }
+        return {pts: newPts, speeds: newSpeeds, headings: newHeadings};
+    }
+
     // NMEA
     function nmeaChecksum(s) {
         let c = 0;
@@ -871,14 +928,16 @@
         btnDownload.classList.add('hidden');
         try {
             log(`Converting: ${file.name}`);
-            const metadata = await parseMP4(file);
+            const {metadata, videoDurationMs} = await parseMP4(file);
 
-            let pts = extractGPS(metadata);
+            const {points: rawPts, totalEntries, firstValidIndex} = extractGPS(metadata);
+            let pts = rawPts;
             if (!pts.length) {
                 throw new Error('No GPS data found');
             }
+            const firstGPSTimeMs = pts[0].time;
 
-            log(`Raw points: ${pts.length}`);
+            log(`Raw points: ${pts.length}, video: ${(videoDurationMs / 1000).toFixed(1)}s`);
             pts = deduplicate(pts);
             log(`After dedup: ${pts.length} (~10Hz)`);
             assignTimestamps(pts);
@@ -898,7 +957,7 @@
                 log(`Interpolated to ${hz}Hz: ${pts.length} points`);
             }
 
-            const {speeds, headings} = computeSpeedHeading(pts);
+            let {speeds, headings} = computeSpeedHeading(pts);
             log('Speed/heading computed');
 
             // GCJ-02
@@ -908,6 +967,23 @@
                     const [la, lo] = wgs2gcj(p.lat, p.lon);
                     p.lat = la;
                     p.lon = lo;
+                }
+            }
+
+            // Pad to full video duration
+            if (videoDurationMs > 0 && totalEntries > 0) {
+                const frameDurationMs = videoDurationMs / totalEntries;
+                const videoStartMs = Math.trunc(firstGPSTimeMs - firstValidIndex * frameDurationMs);
+                const videoEndMs = Math.trunc(videoStartMs + videoDurationMs);
+                const outputHz = chk100hz.checked ? parseInt(hzValue.value) : 10;
+                const prePadSec = Math.max(0, (pts[0].time - videoStartMs) / 1000);
+                const postPadSec = Math.max(0, (videoEndMs - pts[pts.length - 1].time) / 1000);
+                const padded = padToVideoDuration(pts, speeds, headings, videoStartMs, videoEndMs, outputHz);
+                if (padded.pts.length !== pts.length) {
+                    log(`Padded: ${prePadSec.toFixed(1)}s before, ${postPadSec.toFixed(1)}s after GPS data`);
+                    pts = padded.pts;
+                    speeds = padded.speeds;
+                    headings = padded.headings;
                 }
             }
 
