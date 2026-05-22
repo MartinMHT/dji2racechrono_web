@@ -347,22 +347,30 @@
             return results;
         }
 
-        // Extract video duration from mvhd
+        // Extract video duration and creation time from mvhd.
+        // creation_time (ISO 14496-12) = seconds since 1904-01-01 UTC. DJI follows the spec —
+        // value is actual UTC, so subtracting the 1904→1970 delta gives a Unix UTC timestamp
+        // that RaceChrono will display correctly in the viewer's local TZ.
         let videoDurationMs = 0;
+        let creationTimeMs = 0;
+        const MP4_EPOCH_DELTA = 2082844800;
         const mvhdBoxes = findBoxes(moovArr, 0, moovArr.length, 'mvhd');
         if (mvhdBoxes.length) {
             const [mvs, mve] = mvhdBoxes[0];
             const mvhdDv = new DataView(moovArr.buffer, moovArr.byteOffset + mvs);
             const ver = mvhdDv.getUint8(0);
-            let timescale, dur;
+            let timescale, dur, creationSec;
             if (ver === 0) {
+                creationSec = mvhdDv.getUint32(4);
                 timescale = mvhdDv.getUint32(12);
                 dur = mvhdDv.getUint32(16);
             } else {
+                creationSec = Number(mvhdDv.getBigUint64(4));
                 timescale = mvhdDv.getUint32(20);
                 dur = Number(mvhdDv.getBigUint64(24));
             }
             videoDurationMs = dur / timescale * 1000;
+            creationTimeMs = (creationSec - MP4_EPOCH_DELTA) * 1000;
         }
 
         // Walk moov → trak(3) → mdia → minf → stbl → co64/stco + stsz
@@ -426,7 +434,7 @@
             setProgress((end / offsets.length) * 99);
         }
         log(`Metadata extracted: ${totalSize} bytes`);
-        return {metadata, videoDurationMs};
+        return {metadata, videoDurationMs, creationTimeMs};
     }
 
     // ========== Protobuf Decoder ==========
@@ -509,7 +517,7 @@
         return f ? sharedTextDecoder.decode(f[0].value) : ''
     }
 
-    function extractGPS(metadata) {
+    function extractGPS(metadata, startTimeMs, videoDurationMs) {
         log('Decoding protobuf...');
         const root = pbDecode(metadata, 0, metadata.length);
 
@@ -524,9 +532,13 @@
             }
         }
 
-        // Extract GPS points: root.3[].4.2.{1.{2,3}, 2, 6.1}
+        // Extract GPS points: root.3[].4.2.{1.{2,3}, 2}
+        // We ignore the dtStr field (.6.1) — it can be off by hours (camera GPS module bug).
+        // Absolute time is anchored to mvhd.creation_time (survives file renames),
+        // advancing by video frame index.
         const gpsEntries = pbGetMsgAll(root, 3);
         log(`Raw GPS entries: ${gpsEntries.length}`);
+        const frameDurationMs = gpsEntries.length > 0 ? videoDurationMs / gpsEntries.length : 0;
         const points = [];
         let firstValidIndex = -1;
         let lastValidIndex = -1;
@@ -548,8 +560,6 @@
                 const lat = pbGetDouble(info, 2);
                 const lon = pbGetDouble(info, 3);
                 const altMm = pbGetVarint(coords, 2);
-                const dtMsg = pbGetMsg(coords, 6);
-                const dtStr = dtMsg ? pbGetString(dtMsg, 1) : '';
                 if (lat === 0 && lon === 0) {
                     continue;
                 }
@@ -557,7 +567,8 @@
                     firstValidIndex = i;
                 }
                 lastValidIndex = i;
-                points.push({lat, lon, alt: altMm / 1000, time: new Date(dtStr).getTime()});
+                const t = Math.trunc(startTimeMs + i * frameDurationMs);
+                points.push({lat, lon, alt: altMm / 1000, time: t});
             } catch (e) {
                 continue;
             }
@@ -928,9 +939,12 @@
         btnDownload.classList.add('hidden');
         try {
             log(`Converting: ${file.name}`);
-            const {metadata, videoDurationMs} = await parseMP4(file);
+            const {metadata, videoDurationMs, creationTimeMs} = await parseMP4(file);
+            if (!creationTimeMs) {
+                throw new Error('No mvhd creation_time — cannot determine recording start');
+            }
 
-            const {points: rawPts, totalEntries, firstValidIndex} = extractGPS(metadata);
+            const {points: rawPts, totalEntries, firstValidIndex} = extractGPS(metadata, creationTimeMs, videoDurationMs);
             let pts = rawPts;
             if (!pts.length) {
                 throw new Error('No GPS data found');
