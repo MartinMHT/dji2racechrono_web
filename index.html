@@ -181,6 +181,7 @@
         <input type="range" id="hzValue" min="10" max="100" step="10" value="100">
         <span class="range-val" id="hzVal">100</span>
     </div>
+    <label><input type="checkbox" id="chkGcj" checked> GCJ-02 Offset (China)</label>
 </div>
 
 <div class="card">
@@ -213,6 +214,7 @@
     const hzValue = $('hzValue');
     const hzVal = $('hzVal');
     const hzRow = $('hzRow');
+    const chkGcj = $('chkGcj');
 
     let selectedFile = null;
     let nmeaBlob = null;
@@ -975,7 +977,7 @@
             log('Speed/heading computed');
 
             // GCJ-02
-            if (pts.length && inChina(pts[0].lat, pts[0].lon)) {
+            if (chkGcj.checked && pts.length && inChina(pts[0].lat, pts[0].lon)) {
                 log('Applying GCJ-02 offset...');
                 for (const p of pts) {
                     const [la, lo] = wgs2gcj(p.lat, p.lon);
